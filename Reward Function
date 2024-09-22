@@ -1,0 +1,140 @@
+import math
+
+# Constants
+MIN_SPEED = 2.1                     # Model specific. Critical to keep in sync with model's actions space
+MAX_SPEED = 4.0                     # Model specific. Critical to keep in sync with model's actions space
+MAX_STEERING = 30.0                 # Model specific. Critical to keep in sync with model's actions space
+MAX_DIRECTION_DIFF = 30.0
+MAX_STEPS_TO_DECAY_PENALTY = 0      # Value of zero or below disables penalty for having wheels off track
+MAX_STEPS_TO_PROGRESS_RATIO = 1.8   # Desired maximum number of steps to be taken for 1% of progress
+RACING_LINE_SMOOTHING_STEPS = 1     # Track specific. Critical to keep in sync with optimal racing line
+RACING_LINE_WIDTH_FREE_ZONE = 0.10  # Percentage of racing line width for 100% of "being on track" reward
+RACING_LINE_WIDTH_SAFE_ZONE = 0.25  # Percentage of racing line width for distance relative "being on track" reward
+RACING_LINE_VS_CENTRAL_LINE = 0.85  # Number in range of [0, 1]. Zero forces to follow central line, 1 - racing line
+SENSITIVITY_EXP_CNT_DISTANCE = 3.00  # Higher number gives more freedom on the track, can cause zig-zags
+SENSITIVITY_EXP_ACTION_SPEED = 3.00  # Higher number increases penalty for low speed
+SENSITIVITY_EXP_ACTION_STEER = 0.70  # Higher number decreases penalty for high steering
+SENSITIVITY_EXP_DIR_STEERING = 2.00  # Lower number accelerates penalty increase for not following track direction
+TOTAL_PENALTY_ON_OFF_TRACK = 0.999999  # Maximum penalty in percentage of total reward for being off track
+TOTAL_PENALTY_ON_BAD_SPEED = 0.500000  # Maximum penalty in percentage of total reward for being off track
+TOTAL_PENALTY_ON_OFF_DIR_STEER = 0.35  # Maximum penalty in percentage of total reward for off directional steering
+REWARD_WEIGHT_PROG_STEP = 35
+REWARD_WEIGHT_EXP_SPEED = 25
+REWARD_WEIGHT_DIR_STEER = 20
+REWARD_WEIGHT_ON_TRACK = 15
+MAX_TOTAL_REWARD = REWARD_WEIGHT_ON_TRACK + REWARD_WEIGHT_PROG_STEP + REWARD_WEIGHT_DIR_STEER + REWARD_WEIGHT_EXP_SPEED
+
+# Static variables
+smoothed_central_line = None
+was_off_track_at_step = -MAX_STEPS_TO_DECAY_PENALTY
+previous_steps_reward = MAX_TOTAL_REWARD
+
+# Helper functions
+def calc_slope(prev_point, next_point):
+    return math.degrees(math.atan2(next_point[1] - prev_point[1], next_point[0] - prev_point[0]))
+
+def calc_direction_diff(steering, heading, track_direction):
+    direction_diff = steering + heading - track_direction
+    if direction_diff > 180.0:
+        direction_diff -= 360.0
+    if direction_diff < -180.0:
+        direction_diff += 360.0
+    return abs(direction_diff)
+
+def calc_distance(prev_point, next_point):
+    delta_x = next_point[0] - prev_point[0]
+    delta_y = next_point[1] - prev_point[1]
+    return math.hypot(delta_x, delta_y)
+
+def smooth_central_line(center_line, max_offset, pp=0.10, p=0.05, c=0.70, n=0.05, nn=0.10, iterations=72, skip_step=1):
+    if max_offset < 0.0001:
+        return center_line
+    if skip_step < 1:
+        skip_step = 1
+    smoothed_line = center_line
+    for _ in range(iterations):
+        smoothed_line = smooth_central_line_internal(center_line, max_offset, smoothed_line, pp, p, c, n, nn, skip_step)
+    return smoothed_line
+
+def smooth_central_line_internal(center_line, max_offset, smoothed_line, pp, p, c, n, nn, skip_step):
+    length = len(center_line)
+    new_line = [[0.0 for _ in range(2)] for _ in range(length)]
+    for i in range(length):
+        wpp = smoothed_line[(i - 2 * skip_step + length) % length]
+        wp = smoothed_line[(i - skip_step + length) % length]
+        wc = smoothed_line[i]
+        wn = smoothed_line[(i + skip_step) % length]
+        wnn = smoothed_line[(i + 2 * skip_step) % length]
+        new_line[i][0] = pp * wpp[0] + p * wp[0] + c * wc[0] + n * wn[0] + nn * wnn[0]
+        new_line[i][1] = pp * wpp[1] + p * wp[1] + c * wc[1] + n * wn[1] + nn * wnn[1]
+        while calc_distance(new_line[i], center_line[i]) >= max_offset:
+            new_line[i][0] = (0.98 * new_line[i][0]) + (0.02 * center_line[i][0])
+            new_line[i][1] = (0.98 * new_line[i][1]) + (0.02 * center_line[i][1])
+    return new_line
+
+def calc_distance_from_line(curr_point, prev_point, next_point):
+    distance_cp_to_pp = calc_distance(curr_point, prev_point)
+    distance_cp_to_np = calc_distance(curr_point, next_point)
+    distance_pp_to_np = calc_distance(prev_point, next_point)
+    angle_pp = math.acos((distance_cp_to_pp**2 + distance_pp_to_np**2 - distance_cp_to_np**2) / (2 * distance_cp_to_pp * distance_pp_to_np))
+    return distance_cp_to_pp * math.sin(angle_pp)
+
+def ema(prev, new, period):
+    k = 2.0 / (1.0 + period)
+    return (new - prev) * k + prev
+
+# Reward function
+def reward_function(params):
+    # Check for missing values
+    if 'trackDirection' not in params or params['trackDirection'] is None:
+        raise ValueError("trackDirection is missing")
+    
+    if 'trackArn' not in params or params['trackArn'] is None:
+        raise ValueError("trackArn is missing")
+    
+    track_width = params['track_width']
+    waypoints = params['waypoints']
+
+    # Initialize central line
+    global smoothed_central_line
+    if smoothed_central_line is None:
+        max_offset = track_width * RACING_LINE_VS_CENTRAL_LINE * 0.5
+        smoothed_central_line = smooth_central_line(waypoints, max_offset, skip_step=RACING_LINE_SMOOTHING_STEPS)
+
+    # Re-initialize was_off_track_at_step
+    global was_off_track_at_step
+    steps = params['steps']
+    if steps < was_off_track_at_step:
+        was_off_track_at_step = -MAX_STEPS_TO_DECAY_PENALTY
+    if not params['all_wheels_on_track']:
+        was_off_track_at_step = steps
+
+    global previous_steps_reward
+    if steps <= 2:
+        previous_steps_reward = MAX_TOTAL_REWARD
+
+    # Penalty for wheels being off track
+    wheels_off_track_penalty = 1.0
+    if MAX_STEPS_TO_DECAY_PENALTY > 0:
+        wheels_off_track_penalty = min(steps - was_off_track_at_step, MAX_STEPS_TO_DECAY_PENALTY) / MAX_STEPS_TO_DECAY_PENALTY
+
+    # Reward on directional move to the next milestone
+    wp_length = len(smoothed_central_line)
+    wp_indices = params['closest_waypoints']
+    curr_point = [params['x'], params['y']]
+    prev_point = smoothed_central_line[wp_indices[0]]
+    next_point_1 = smoothed_central_line[(wp_indices[1] + 1) % wp_length]
+    next_point_2 = smoothed_central_line[(wp_indices[1] + 2) % wp_length]
+    next_point_3 = smoothed_central_line[(wp_indices[1] + 3) % wp_length]
+    track_direction_1 = calc_slope(prev_point, next_point_1)
+    track_direction_2 = calc_slope(prev_point, next_point_2)
+    track_direction_3 = calc_slope(prev_point, next_point_3)
+
+    heading = params['heading']
+    steering = params['steering_angle']
+    direction_diff_ratio = (
+            0.20 * min((calc_direction_diff(steering, heading, track_direction_1) / MAX_DIRECTION_DIFF), 1.00) +
+            0.30 * min((calc_direction_diff(steering, heading, track_direction_2) / MAX_DIRECTION_DIFF), 1.00) +
+            0.50 * min((calc_direction_diff(steering, heading, track_direction_3) / MAX_DIRECTION_DIFF), 1.00))
+    dir_steering_ratio = 1.0 - pow(direction_diff_ratio, SENSITIVITY_EXP_DIR_STEERING)
+    reward_dir_steering = REWARD_WEIGHT_DIR
